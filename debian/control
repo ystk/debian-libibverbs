@@ -1,8 +1,9 @@
 Source: libibverbs
 Priority: extra
-Maintainer: Roland Dreier <rolandd@cisco.com>
+Maintainer: Roland Dreier <roland@digitalvampire.org>
+DM-Upload-Allowed: yes
 Build-Depends: debhelper (>= 7.0.50~), dpkg-dev (>= 1.13.19)
-Standards-Version: 3.8.3
+Standards-Version: 3.9.2
 Section: libs
 Homepage: http://www.openfabrics.org/
 
@@ -10,7 +11,7 @@ Package: libibverbs1
 Section: libs
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
-Description: A library for direct userspace use of RDMA (InfiniBand/iWARP)
+Description: Library for direct userspace use of RDMA (InfiniBand/iWARP)
  libibverbs is a library that allows userspace processes to use RDMA
  "verbs" as described in the InfiniBand Architecture Specification and
  the RDMA Protocol Verbs Specification.  iWARP ethernet NICs support

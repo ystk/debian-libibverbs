@@ -257,7 +257,7 @@ static void read_config_file(const char *path)
 
 		field = strsep(&config, "\n\t ");
 
-		if (strcmp(field, "driver") == 0) {
+		if (strcmp(field, "driver") == 0 && config != NULL) {
 			struct ibv_driver_name *driver_name;
 
 			config += strspn(config, "\t ");
@@ -309,7 +309,7 @@ static void read_config(void)
 		if (asprintf(&path, "%s/%s", IBV_CONFIG_DIR, dent->d_name) < 0) {
 			fprintf(stderr, PFX "Warning: couldn't read config file %s/%s.\n",
 				IBV_CONFIG_DIR, dent->d_name);
-			return;
+			goto out;
 		}
 
 		if (stat(path, &buf)) {
@@ -326,6 +326,7 @@ next:
 		free(path);
 	}
 
+out:
 	closedir(conf_dir);
 }
 
