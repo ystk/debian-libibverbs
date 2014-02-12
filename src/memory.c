@@ -40,6 +40,10 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <dirent.h>
+#include <limits.h>
 
 #include "ibverbs.h"
 
@@ -68,12 +72,72 @@ struct ibv_mem_node {
 static struct ibv_mem_node *mm_root;
 static pthread_mutex_t mm_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int page_size;
+static int huge_page_enabled;
 static int too_late;
+
+static unsigned long smaps_page_size(FILE *file)
+{
+	int n;
+	unsigned long size = page_size;
+	char buf[1024];
+
+	while (fgets(buf, sizeof(buf), file) != NULL) {
+		if (!strstr(buf, "KernelPageSize:"))
+			continue;
+
+		n = sscanf(buf, "%*s %lu", &size);
+		if (n < 1)
+			continue;
+
+		/* page size is printed in Kb */
+		size = size * 1024;
+
+		break;
+	}
+
+	return size;
+}
+
+static unsigned long get_page_size(void *base)
+{
+	unsigned long ret = page_size;
+	pid_t pid;
+	FILE *file;
+	char buf[1024];
+
+	pid = getpid();
+	snprintf(buf, sizeof(buf), "/proc/%d/smaps", pid);
+
+	file = fopen(buf, "r");
+	if (!file)
+		goto out;
+
+	while (fgets(buf, sizeof(buf), file) != NULL) {
+		int n;
+		uintptr_t range_start, range_end;
+
+		n = sscanf(buf, "%lx-%lx", &range_start, &range_end);
+
+		if (n < 2)
+			continue;
+
+		if ((uintptr_t) base >= range_start && (uintptr_t) base < range_end) {
+			ret = smaps_page_size(file);
+			break;
+		}
+	}
+
+	fclose(file);
+
+out:
+	return ret;
+}
 
 int ibv_fork_init(void)
 {
-	void *tmp;
+	void *tmp, *tmp_aligned;
 	int ret;
+	unsigned long size;
 
 	if (mm_root)
 		return 0;
@@ -88,8 +152,21 @@ int ibv_fork_init(void)
 	if (posix_memalign(&tmp, page_size, page_size))
 		return ENOMEM;
 
-	ret = madvise(tmp, page_size, MADV_DONTFORK) ||
-	      madvise(tmp, page_size, MADV_DOFORK);
+	if (getenv("RDMAV_HUGEPAGES_SAFE"))
+		huge_page_enabled = 1;
+	else
+		huge_page_enabled = 0;
+
+	if (huge_page_enabled) {
+		size = get_page_size(tmp);
+		tmp_aligned = (void *) ((uintptr_t) tmp & ~(size - 1));
+	} else {
+		size = page_size;
+		tmp_aligned = tmp;
+	}
+
+	ret = madvise(tmp_aligned, size, MADV_DONTFORK) ||
+	      madvise(tmp_aligned, size, MADV_DOFORK);
 
 	free(tmp);
 
@@ -446,70 +523,123 @@ static struct ibv_mem_node *__mm_find_start(uintptr_t start, uintptr_t end)
 	return node;
 }
 
+static struct ibv_mem_node *merge_ranges(struct ibv_mem_node *node,
+					 struct ibv_mem_node *prev)
+{
+	prev->end = node->end;
+	prev->refcnt = node->refcnt;
+	__mm_remove(node);
+
+	return prev;
+}
+
+static struct ibv_mem_node *split_range(struct ibv_mem_node *node,
+					uintptr_t cut_line)
+{
+	struct ibv_mem_node *new_node = NULL;
+
+	new_node = malloc(sizeof *new_node);
+	if (!new_node)
+		return NULL;
+	new_node->start  = cut_line;
+	new_node->end    = node->end;
+	new_node->refcnt = node->refcnt;
+	node->end  = cut_line - 1;
+	__mm_add(new_node);
+
+	return new_node;
+}
+
+static struct ibv_mem_node *get_start_node(uintptr_t start, uintptr_t end,
+					   int inc)
+{
+	struct ibv_mem_node *node, *tmp = NULL;
+
+	node = __mm_find_start(start, end);
+	if (node->start < start)
+		node = split_range(node, start);
+	else {
+		tmp = __mm_prev(node);
+		if (tmp && tmp->refcnt == node->refcnt + inc)
+			node = merge_ranges(node, tmp);
+	}
+	return node;
+}
+
+/*
+ * This function is called if madvise() fails to undo merging/splitting
+ * operations performed on the node.
+ */
+static struct ibv_mem_node *undo_node(struct ibv_mem_node *node,
+				      uintptr_t start, int inc)
+{
+	struct ibv_mem_node *tmp = NULL;
+
+	/*
+	 * This condition can be true only if we merged this
+	 * node with the previous one, so we need to split them.
+	*/
+	if (start > node->start) {
+		tmp = split_range(node, start);
+		if (tmp) {
+			node->refcnt += inc;
+			node = tmp;
+		} else
+			return NULL;
+	}
+
+	tmp  =  __mm_prev(node);
+	if (tmp && tmp->refcnt == node->refcnt)
+		node = merge_ranges(node, tmp);
+
+	tmp  =  __mm_next(node);
+	if (tmp && tmp->refcnt == node->refcnt)
+		node = merge_ranges(tmp, node);
+
+	return node;
+}
+
 static int ibv_madvise_range(void *base, size_t size, int advice)
 {
 	uintptr_t start, end;
 	struct ibv_mem_node *node, *tmp;
 	int inc;
+	int rolling_back = 0;
 	int ret = 0;
+	unsigned long range_page_size;
 
 	if (!size)
 		return 0;
 
-	inc = advice == MADV_DONTFORK ? 1 : -1;
+	if (huge_page_enabled)
+		range_page_size = get_page_size(base);
+	else
+		range_page_size = page_size;
 
-	start = (uintptr_t) base & ~(page_size - 1);
-	end   = ((uintptr_t) (base + size + page_size - 1) &
-		 ~(page_size - 1)) - 1;
+	start = (uintptr_t) base & ~(range_page_size - 1);
+	end   = ((uintptr_t) (base + size + range_page_size - 1) &
+		 ~(range_page_size - 1)) - 1;
 
 	pthread_mutex_lock(&mm_mutex);
+again:
+	inc = advice == MADV_DONTFORK ? 1 : -1;
 
-	node = __mm_find_start(start, end);
-
-	if (node->start < start) {
-		tmp = malloc(sizeof *tmp);
-		if (!tmp) {
-			ret = -1;
-			goto out;
-		}
-
-		tmp->start  = start;
-		tmp->end    = node->end;
-		tmp->refcnt = node->refcnt;
-		node->end   = start - 1;
-
-		__mm_add(tmp);
-		node = tmp;
-	} else {
-		tmp = __mm_prev(node);
-		if (tmp && tmp->refcnt == node->refcnt + inc) {
-			tmp->end = node->end;
-			tmp->refcnt = node->refcnt;
-			__mm_remove(node);
-			node = tmp;
-		}
+	node = get_start_node(start, end, inc);
+	if (!node) {
+		ret = -1;
+		goto out;
 	}
 
 	while (node && node->start <= end) {
 		if (node->end > end) {
-			tmp = malloc(sizeof *tmp);
-			if (!tmp) {
+			if (!split_range(node, end + 1)) {
 				ret = -1;
 				goto out;
 			}
-
-			tmp->start  = end + 1;
-			tmp->end    = node->end;
-			tmp->refcnt = node->refcnt;
-			node->end   = end;
-
-			__mm_add(tmp);
 		}
 
-		node->refcnt += inc;
-
-		if ((inc == -1 && node->refcnt == 0) ||
-		    (inc ==  1 && node->refcnt == 1)) {
+		if ((inc == -1 && node->refcnt == 1) ||
+		    (inc ==  1 && node->refcnt == 0)) {
 			/*
 			 * If this is the first time through the loop,
 			 * and we merged this node with the previous
@@ -528,22 +658,38 @@ static int ibv_madvise_range(void *base, size_t size, int advice)
 				ret = madvise((void *) node->start,
 					      node->end - node->start + 1,
 					      advice);
-			if (ret)
-				goto out;
+			if (ret) {
+				node = undo_node(node, start, inc);
+
+				if (rolling_back || !node)
+					goto out;
+
+				/* madvise failed, roll back previous changes */
+				rolling_back = 1;
+				advice = advice == MADV_DONTFORK ?
+					MADV_DOFORK : MADV_DONTFORK;
+				tmp = __mm_prev(node);
+				if (!tmp || start > tmp->end)
+					goto out;
+				end = tmp->end;
+				goto again;
+			}
 		}
 
+		node->refcnt += inc;
 		node = __mm_next(node);
 	}
 
 	if (node) {
 		tmp = __mm_prev(node);
-		if (tmp && node->refcnt == tmp->refcnt) {
-			tmp->end = node->end;
-			__mm_remove(node);
-		}
+		if (tmp && node->refcnt == tmp->refcnt)
+			node = merge_ranges(node, tmp);
 	}
 
 out:
+	if (rolling_back)
+		ret = -1;
+
 	pthread_mutex_unlock(&mm_mutex);
 
 	return ret;

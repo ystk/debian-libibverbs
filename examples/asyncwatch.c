@@ -57,6 +57,8 @@ static const char *event_name_str(enum ibv_event_type event_type)
 		return "IBV_EVENT_SM_CHANGE";
 	case IBV_EVENT_CLIENT_REREGISTER:
 		return "IBV_EVENT_CLIENT_REREGISTER";
+	case IBV_EVENT_GID_CHANGE:
+		return "IBV_EVENT_GID_CHANGE";
 
 	case IBV_EVENT_CQ_ERR:
 	case IBV_EVENT_QP_FATAL:
@@ -79,6 +81,9 @@ int main(int argc, char *argv[])
 	struct ibv_device **dev_list;
 	struct ibv_context *context;
 	struct ibv_async_event event;
+
+	/* Force line-buffering in case stdout is redirected */
+	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	dev_list = ibv_get_device_list(NULL);
 	if (!dev_list) {
