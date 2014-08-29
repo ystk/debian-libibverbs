@@ -68,6 +68,7 @@ struct pingpong_context {
 	struct ibv_qp		*qp[MAX_QP];
 	void			*buf;
 	int			 size;
+	int			 send_flags;
 	int			 num_qp;
 	int			 rx_depth;
 	int			 pending[MAX_QP];
@@ -350,14 +351,15 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 	if (!ctx)
 		return NULL;
 
-	ctx->size     = size;
-	ctx->num_qp   = num_qp;
-	ctx->rx_depth = rx_depth;
+	ctx->size       = size;
+	ctx->send_flags = IBV_SEND_SIGNALED;
+	ctx->num_qp     = num_qp;
+	ctx->rx_depth   = rx_depth;
 
 	ctx->buf = memalign(page_size, size);
 	if (!ctx->buf) {
 		fprintf(stderr, "Couldn't allocate work buf.\n");
-		return NULL;
+		goto clean_ctx;
 	}
 
 	memset(ctx->buf, 0, size);
@@ -366,14 +368,14 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 	if (!ctx->context) {
 		fprintf(stderr, "Couldn't get context for %s\n",
 			ibv_get_device_name(ib_dev));
-		return NULL;
+		goto clean_buffer;
 	}
 
 	if (use_event) {
 		ctx->channel = ibv_create_comp_channel(ctx->context);
 		if (!ctx->channel) {
 			fprintf(stderr, "Couldn't create completion channel\n");
-			return NULL;
+			goto clean_device;
 		}
 	} else
 		ctx->channel = NULL;
@@ -381,20 +383,20 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 	ctx->pd = ibv_alloc_pd(ctx->context);
 	if (!ctx->pd) {
 		fprintf(stderr, "Couldn't allocate PD\n");
-		return NULL;
+		goto clean_comp_channel;
 	}
 
 	ctx->mr = ibv_reg_mr(ctx->pd, ctx->buf, size, IBV_ACCESS_LOCAL_WRITE);
 	if (!ctx->mr) {
 		fprintf(stderr, "Couldn't register MR\n");
-		return NULL;
+		goto clean_pd;
 	}
 
 	ctx->cq = ibv_create_cq(ctx->context, rx_depth + num_qp, NULL,
 				ctx->channel, 0);
 	if (!ctx->cq) {
 		fprintf(stderr, "Couldn't create CQ\n");
-		return NULL;
+		goto clean_mr;
 	}
 
 	{
@@ -408,12 +410,13 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 		ctx->srq = ibv_create_srq(ctx->pd, &attr);
 		if (!ctx->srq)  {
 			fprintf(stderr, "Couldn't create SRQ\n");
-			return NULL;
+			goto clean_cq;
 		}
 	}
 
 	for (i = 0; i < num_qp; ++i) {
-		struct ibv_qp_init_attr attr = {
+		struct ibv_qp_attr attr;
+		struct ibv_qp_init_attr init_attr = {
 			.send_cq = ctx->cq,
 			.recv_cq = ctx->cq,
 			.srq     = ctx->srq,
@@ -424,10 +427,14 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 			.qp_type = IBV_QPT_RC
 		};
 
-		ctx->qp[i] = ibv_create_qp(ctx->pd, &attr);
+		ctx->qp[i] = ibv_create_qp(ctx->pd, &init_attr);
 		if (!ctx->qp[i])  {
 			fprintf(stderr, "Couldn't create QP[%d]\n", i);
-			return NULL;
+			goto clean_qps;
+		}
+		ibv_query_qp(ctx->qp[i], &attr, IBV_QP_CAP, &init_attr);
+		if (init_attr.cap.max_inline_data >= size) {
+			ctx->send_flags |= IBV_SEND_INLINE;
 		}
 	}
 
@@ -445,11 +452,44 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 				  IBV_QP_PORT               |
 				  IBV_QP_ACCESS_FLAGS)) {
 			fprintf(stderr, "Failed to modify QP[%d] to INIT\n", i);
-			return NULL;
+			goto clean_qps_full;
 		}
 	}
 
 	return ctx;
+
+clean_qps_full:
+	i = num_qp;
+
+clean_qps:
+	for (--i; i >= 0; --i)
+		ibv_destroy_qp(ctx->qp[i]);
+
+	ibv_destroy_srq(ctx->srq);
+
+clean_cq:
+	ibv_destroy_cq(ctx->cq);
+
+clean_mr:
+	ibv_dereg_mr(ctx->mr);
+
+clean_pd:
+	ibv_dealloc_pd(ctx->pd);
+
+clean_comp_channel:
+	if (ctx->channel)
+		ibv_destroy_comp_channel(ctx->channel);
+
+clean_device:
+	ibv_close_device(ctx->context);
+
+clean_buffer:
+	free(ctx->buf);
+
+clean_ctx:
+	free(ctx);
+
+	return NULL;
 }
 
 int pp_close_ctx(struct pingpong_context *ctx, int num_qp)
@@ -535,7 +575,7 @@ static int pp_post_send(struct pingpong_context *ctx, int qp_index)
 		.sg_list    = &list,
 		.num_sge    = 1,
 		.opcode     = IBV_WR_SEND,
-		.send_flags = IBV_SEND_SIGNALED,
+		.send_flags = ctx->send_flags,
 	};
 	struct ibv_send_wr *bad_wr;
 
