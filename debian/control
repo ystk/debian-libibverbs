@@ -10,6 +10,7 @@ Package: libibverbs1
 Section: libs
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Breaks: libopenmpi1.3
 Description: Library for direct userspace use of RDMA (InfiniBand/iWARP)
  libibverbs is a library that allows userspace processes to use RDMA
  "verbs" as described in the InfiniBand Architecture Specification and

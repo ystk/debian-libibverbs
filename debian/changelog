@@ -1,3 +1,13 @@
+libibverbs (1.1.8-1.1) unstable; urgency=medium
+
+  * Non-maintainer upload.
+
+  [ Andreas Beckmann ]
+  * Add 'Breaks: libopenmpi1.3' to smoothen the openmpi transition on some
+    wheezy -> jessie upgrade paths.  (Closes: #780629)
+
+ -- gregor herrmann <gregoa@debian.org>  Sat, 28 Mar 2015 22:49:21 +0100
+
 libibverbs (1.1.8-1) unstable; urgency=low
 
   * New upstream release.
